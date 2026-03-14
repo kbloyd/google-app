@@ -1,0 +1,17 @@
+{
+  "servers": {
+    "pdf-reader": {
+      "command": "npx",
+      "args": [
+        "@sylphx/pdf-reader-mcp"
+      ],
+      "env": {
+        // Optional: switch to HTTP transport if you run it remotely
+        // "MCP_TRANSPORT": "stdio",
+        // "MCP_HTTP_PORT": "8080",
+        // "MCP_HTTP_HOST": "0.0.0.0",
+        // "MCP_API_KEY": ""
+      }
+    }
+  }
+}
