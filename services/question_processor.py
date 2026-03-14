@@ -200,7 +200,15 @@ def _deduplicate_and_validate(
         options = q.get("options") or []
         if not isinstance(options, list):
             options = []
-        options = [str(opt).strip() for opt in options if str(opt).strip()]
+        # Strip whitespace, drop blanks, and deduplicate (preserving order)
+        seen_opts: set[str] = set()
+        deduped_options: list[str] = []
+        for opt in options:
+            opt_str = str(opt).strip()
+            if opt_str and opt_str not in seen_opts:
+                seen_opts.add(opt_str)
+                deduped_options.append(opt_str)
+        options = deduped_options
 
         q_type = str(q.get("type", "multiple_choice")).strip().lower()
         allowed_types = {

@@ -44,7 +44,7 @@ def _post_to_apps_script(payload: dict[str, Any]) -> dict[str, Any]:
 
     for attempt in range(_MAX_RETRIES):
         try:
-            with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+            with httpx.Client(timeout=180.0, follow_redirects=True) as client:
                 response = client.post(
                     apps_script_url,
                     json=payload,

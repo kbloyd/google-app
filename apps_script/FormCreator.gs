@@ -25,11 +25,16 @@
  * the same createChoice / setPoints / setFeedback* API surface.
  */
 function _setChoicesWithFeedback(item, options, correctAnswer, points, explanation) {
+  // Verify correctAnswer is actually in the options list
+  var hasCorrect = options.indexOf(correctAnswer) !== -1;
   item.setChoices(options.map(function(opt) {
-    return item.createChoice(opt, opt === correctAnswer);
+    return item.createChoice(opt, hasCorrect && opt === correctAnswer);
   }));
-  item.setPoints(points);
-  if (explanation) {
+  // Only set points when there is a valid correct answer and positive points
+  if (hasCorrect && points > 0) {
+    item.setPoints(points);
+  }
+  if (explanation && hasCorrect) {
     item.setFeedbackForCorrect(
       FormApp.createFeedback().setText(explanation).build()
     );
@@ -71,19 +76,32 @@ function doPost(e) {
       }
     }
 
+    // Google Forms title limit (~1600 chars); overflow goes to helpText
+    var TITLE_LIMIT = 1500;
+    function _safeTitleAndHelp(formItem, text) {
+      text = text || '';
+      if (text.length <= TITLE_LIMIT) {
+        formItem.setTitle(text);
+      } else {
+        formItem.setTitle(text.substring(0, TITLE_LIMIT) + '…');
+        formItem.setHelpText(text);
+      }
+    }
+
     function addContextItem(item) {
       if (!item) {
         return;
       }
+      try {
       if (item.type === 'section') {
         var pageBreak = form.addPageBreakItem();
-        pageBreak.setTitle(item.title || '');
+        pageBreak.setTitle((item.title || '').substring(0, TITLE_LIMIT));
       } else if (item.type === 'paragraph') {
         var textItem = form.addSectionHeaderItem();
-        textItem.setTitle(item.text || '');
+        _safeTitleAndHelp(textItem, item.text || '');
       } else if (item.type === 'table') {
         var tableItem = form.addSectionHeaderItem();
-        tableItem.setTitle(item.text || '');
+        _safeTitleAndHelp(tableItem, item.text || '');
       } else if (item.type === 'image') {
         var imageItem = form.addImageItem();
         if (item.title) {
@@ -106,6 +124,9 @@ function doPost(e) {
           }
         }
       }
+      } catch (ctxErr) {
+        Logger.log('Skipping context item (type=' + (item.type || 'unknown') + '): ' + ctxErr.toString());
+      }
     }
 
     function addQuestion(q, index) {
@@ -116,6 +137,19 @@ function doPost(e) {
       var correctAnswer = q.correct_answer || q.correctAnswer || '';
       var explanation = q.explanation || '';
       var points = q.points || 0;
+
+      try {
+      // Deduplicate options (Google Forms rejects duplicate choice values)
+      var seen = {};
+      var uniqueOptions = [];
+      for (var oi = 0; oi < options.length; oi++) {
+        var optKey = options[oi];
+        if (!seen[optKey]) {
+          seen[optKey] = true;
+          uniqueOptions.push(optKey);
+        }
+      }
+      options = uniqueOptions;
 
       if (type === 'checkbox') {
         var checkbox = form.addCheckboxItem();
@@ -137,16 +171,29 @@ function doPost(e) {
         paragraphText.setTitle(questionText);
         paragraphText.setRequired(required);
       } else {
-        var mc = form.addMultipleChoiceItem();
-        mc.setTitle(questionText);
-        if (options.length) {
+        // Default: multiple_choice — must have at least one option
+        if (!options.length) {
+          var text2 = form.addTextItem();
+          text2.setTitle(questionText);
+          text2.setRequired(required);
+        } else {
+          var mc = form.addMultipleChoiceItem();
+          mc.setTitle(questionText);
           if (correctAnswer) {
             _setChoicesWithFeedback(mc, options, correctAnswer, points, explanation);
           } else {
             mc.setChoiceValues(options);
           }
+          mc.setRequired(required);
         }
-        mc.setRequired(required);
+      }
+      } catch (qErr) {
+        Logger.log('Error adding question ' + index + ': ' + qErr.toString());
+        // Fallback: add as plain text item so the question isn't lost
+        try {
+          var fallback = form.addTextItem();
+          fallback.setTitle(questionText);
+        } catch (ignore) {}
       }
     }
 

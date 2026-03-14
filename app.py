@@ -426,6 +426,10 @@ def _apply_answer_key(
             q["points"] = 1
             if ak_entry.get("explanation"):
                 q["explanation"] = ak_entry["explanation"]
+        else:
+            # Remove stale correct_answer if it doesn't match any option
+            q.pop("correct_answer", None)
+            q.pop("points", None)
 
 
 def _strip_inline_answers_from_items(items: list[dict[str, Any]]) -> None:
@@ -546,6 +550,13 @@ def convert():
 
         # Apply answer key for quiz grading
         _apply_answer_key(questions, answer_key)
+
+        # Sanitize: remove correct_answer if it doesn't match any option
+        for q in questions:
+            ca = q.get("correct_answer")
+            if ca and ca not in (q.get("options") or []):
+                q.pop("correct_answer", None)
+                q.pop("points", None)
 
         if not questions:
             flash(
