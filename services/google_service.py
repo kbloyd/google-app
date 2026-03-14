@@ -112,7 +112,11 @@ def _extract_paragraph_text(paragraph: dict[str, Any]) -> str:
     parts: list[str] = []
     for prop in paragraph.get("elements", []):
         if "textRun" in prop:
-            parts.append(prop["textRun"].get("content", ""))
+            text_run = prop["textRun"]
+            # Skip strikethrough text
+            if text_run.get("textStyle", {}).get("strikethrough"):
+                continue
+            parts.append(text_run.get("content", ""))
         elif "inlineObjectElement" in prop:
             parts.append("[Image]")
         elif "footnoteReference" in prop:
@@ -308,7 +312,11 @@ def _extract_paragraph_items(
 
     for prop in paragraph.get("elements", []):
         if "textRun" in prop:
-            text_parts.append(prop["textRun"].get("content", ""))
+            text_run = prop["textRun"]
+            # Skip strikethrough text
+            if text_run.get("textStyle", {}).get("strikethrough"):
+                continue
+            text_parts.append(text_run.get("content", ""))
         elif "inlineObjectElement" in prop:
             flush_text()
             inline_object_id = prop["inlineObjectElement"].get("inlineObjectId")

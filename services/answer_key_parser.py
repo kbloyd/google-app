@@ -3,7 +3,7 @@
 import re
 from typing import Any
 
-from services.constants import AK_PARAGRAPH_PATTERN
+from services.constants import AK_PARAGRAPH_PATTERN, INLINE_ANSWER_PATTERN
 
 
 def parse_answer_key(
@@ -12,11 +12,12 @@ def parse_answer_key(
     item_id_to_index: dict[int, int],
     answer_key_start_index: int,
 ) -> dict[int, dict[str, str]]:
-    """Extract an answer key from table rows or paragraph text.
+    """Extract an answer key by merging inline, table, and paragraph sources.
 
-    Scans items at or after *answer_key_start_index* for answer-key data.
-    Tables are tried first; if no table-based key is found, paragraph text
-    is parsed using the ``1. B) …`` pattern.
+    Priority (later sources override earlier ones):
+    1. Inline answers found before the answer-key section (lowest).
+    2. Table-based answers from the answer-key section.
+    3. Paragraph-based answers from the answer-key section (highest).
 
     Args:
         item_ids_in_order: Document item IDs in document order.
@@ -27,13 +28,65 @@ def parse_answer_key(
     Returns:
         Mapping of 1-based question number → ``{"correct_answer": …, "explanation": …}``.
     """
-    answer_key = _parse_table_answer_key(
+    answer_key: dict[int, dict[str, str]] = {}
+
+    # Inline answers (lowest priority)
+    inline = _parse_inline_answer_key(
         item_ids_in_order, item_by_id, item_id_to_index, answer_key_start_index
     )
-    if not answer_key:
-        answer_key = _parse_paragraph_answer_key(
-            item_ids_in_order, item_by_id, item_id_to_index, answer_key_start_index
-        )
+    answer_key.update(inline)
+
+    # Table-based answers (override inline)
+    table = _parse_table_answer_key(
+        item_ids_in_order, item_by_id, item_id_to_index, answer_key_start_index
+    )
+    answer_key.update(table)
+
+    # Paragraph-based answers (highest priority)
+    paragraph = _parse_paragraph_answer_key(
+        item_ids_in_order, item_by_id, item_id_to_index, answer_key_start_index
+    )
+    answer_key.update(paragraph)
+
+    return answer_key
+
+
+def _parse_inline_answer_key(
+    item_ids_in_order: list[int],
+    item_by_id: dict[int, dict[str, Any]],
+    item_id_to_index: dict[int, int],
+    answer_key_start_index: int,
+) -> dict[int, dict[str, str]]:
+    """Extract inline answer keys from paragraphs before the answer-key section."""
+    answer_key: dict[int, dict[str, str]] = {}
+    question_counter = 0
+    question_number_pattern = re.compile(r"^\d+[.)]\s+")
+
+    for item_id in item_ids_in_order:
+        if item_id_to_index[item_id] >= answer_key_start_index:
+            break
+
+        item = item_by_id[item_id]
+        if item.get("type") not in {"paragraph", "section"}:
+            continue
+
+        text = str(item.get("text") or item.get("title") or "").strip()
+        if not text:
+            continue
+
+        # Check if this looks like a new question
+        if question_number_pattern.match(text):
+            question_counter += 1
+
+        # Check for inline answer
+        match = INLINE_ANSWER_PATTERN.search(text)
+        if match and question_counter > 0:
+            answer_text = match.group(1).strip()
+            answer_key[question_counter] = {
+                "correct_answer": answer_text,
+                "explanation": "",
+            }
+
     return answer_key
 
 

@@ -12,6 +12,8 @@ from services.constants import (
     OPTION_CHECKBOX_PATTERN,
     OPTION_LETTER_PATTERN,
     OPTION_NUMBER_PATTERN,
+    QUESTION_TYPE_LABEL_PATTERN,
+    STANDARD_ANNOTATION_PATTERN,
     UNDERSCORE_FILLER_PATTERN,
 )
 
@@ -183,7 +185,16 @@ def _deduplicate_and_validate(
     unique_questions: list[dict[str, Any]] = []
     for q in questions:
         question_text = str(q.get("question", "")).strip()
+        # Strip leading question numbers (e.g. "28. Which..." → "Which...")
+        question_text = LEADING_NUMBER_PATTERN.sub("", question_text).strip()
+        # Strip standard annotation prefixes (e.g. "(RL.9-10.4) ...")
+        question_text = STANDARD_ANNOTATION_PATTERN.sub("", question_text).strip()
+        q["question"] = question_text
+
         if not question_text:
+            continue
+        # Skip question-type labels that aren't real questions
+        if QUESTION_TYPE_LABEL_PATTERN.match(question_text):
             continue
 
         options = q.get("options") or []

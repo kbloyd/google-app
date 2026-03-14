@@ -21,7 +21,7 @@ from services import (
     parser,
     question_processor,
 )
-from services.constants import ANSWER_NORMALIZE_PATTERN
+from services.constants import ANSWER_NORMALIZE_PATTERN, INLINE_ANSWER_PATTERN
 
 load_dotenv()
 
@@ -428,6 +428,24 @@ def _apply_answer_key(
                 q["explanation"] = ak_entry["explanation"]
 
 
+def _strip_inline_answers_from_items(items: list[dict[str, Any]]) -> None:
+    """Remove inline answer patterns from item text in-place.
+
+    Prevents 'Answer: X' lines from appearing as form context while
+    the answer values are already captured by the answer key parser.
+    """
+    for item in items:
+        if item.get("type") not in {"paragraph", "section"}:
+            continue
+        for field in ("text", "title"):
+            value = item.get(field)
+            if not value:
+                continue
+            cleaned = INLINE_ANSWER_PATTERN.sub("", str(value)).strip()
+            if cleaned != value:
+                item[field] = cleaned
+
+
 @app.route("/")
 def index():
     return render_template_string(
@@ -484,6 +502,9 @@ def convert():
         answer_key = answer_key_parser.parse_answer_key(
             item_ids_in_order, item_by_id, item_id_to_index, answer_key_start_index
         )
+
+        # Strip inline answer text from items so it doesn't appear in the form
+        _strip_inline_answers_from_items(doc_items)
 
         # Build paragraph items for anchoring
         paragraph_items: list[tuple[int, str]] = []

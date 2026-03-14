@@ -23,6 +23,7 @@ Return a JSON array with objects containing:
 - "type": "multiple_choice", "checkbox", "short_answer", or "paragraph"
 - "options": Array of answer choices (2-4 options typical)
 - "required": boolean (default: false)
+- "correct_answer": Optional string. The correct answer if an inline answer key is present.
 - "context_ids": Optional array of numeric ids for nearby context items
 
 Example output format:
@@ -59,6 +60,17 @@ Type rules:
 - Use "checkbox" when multiple options may be selected.
 - Use "short_answer" for brief free-text responses.
 - Use "paragraph" for longer free-text responses (essay/explanation prompts).
+- **IMPORTANT**: Use "short_answer" for fill-in-the-blank questions. These include questions with blanks shown as underscores (______), [blank], or instructions like "fill in", "complete the sentence", or "write in the blank". Do NOT extract blank placeholders as options.
+
+Inline answer keys:
+- If a question is followed by an inline answer like "Answer: B", "Answer: Harper Lee", or "Correct answer: C", extract only the answer value into a "correct_answer" field on that question.
+- Do NOT include the "Answer: X" line as part of the question text or options.
+- Only include "correct_answer" when an inline answer is explicitly present. If no answer is given, omit the field.
+- "Answer (Sample Response):" patterns indicate a sample answer for free-text questions — include the sample text as the "correct_answer".
+
+Numbering:
+- Strip leading question numbers (e.g., "1.", "28.", "1)") from the question text. The form will add its own numbering.
+- Strip standard annotation prefixes like "(RL.9-10.4)" or "(W.9-10.9)" from the question text.
 
 Ignore any answer key, solution key, or explanation section intended for graders.
 Do not extract answer-key content as questions or context.
