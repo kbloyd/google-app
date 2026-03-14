@@ -1,5 +1,7 @@
 import base64
+import logging
 import os
+import threading
 from io import BytesIO
 from typing import Any
 
@@ -9,7 +11,22 @@ from googleapiclient import discovery
 from googleapiclient.errors import HttpError
 from PIL import Image, ImageDraw, ImageFont
 
+logger = logging.getLogger(__name__)
+
 DISCOVERY_DOC_FORMS = "https://forms.googleapis.com/$discovery/rest?version=v1"
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+_credentials_lock = threading.Lock()
+_cached_credentials: service_account.Credentials | None = None
+
+
+def _get_cached_credentials() -> service_account.Credentials:
+    """Return lazily-cached Google service-account credentials."""
+    global _cached_credentials
+    with _credentials_lock:
+        if _cached_credentials is None or not _cached_credentials.valid:
+            _cached_credentials = get_credentials()
+        return _cached_credentials
 
 
 def get_credentials() -> service_account.Credentials:
@@ -61,13 +78,15 @@ def get_credentials() -> service_account.Credentials:
 
 
 def get_docs_service():
-    credentials = get_credentials()
+    """Build and return a Google Docs API service client."""
+    credentials = _get_cached_credentials()
     service = discovery.build("docs", "v1", credentials=credentials)
     return service
 
 
 def get_forms_service():
-    credentials = get_credentials()
+    """Build and return a Google Forms API service client."""
+    credentials = _get_cached_credentials()
     service = discovery.build(
         "forms",
         "v1",
@@ -142,24 +161,62 @@ def _get_inline_object_details(
 def _fetch_image_data(
     session: AuthorizedSession, url: str
 ) -> tuple[str | None, str | None]:
+    """Fetch image from *url* via *session* and return (base64_data, mime_type).
+
+    Returns ``(None, None)`` when the image cannot be fetched or exceeds
+    :data:`MAX_IMAGE_SIZE`.
+    """
     try:
+        # HEAD request first to check size without downloading
+        head_resp = session.head(url)
+        content_length = int(head_resp.headers.get("Content-Length", 0))
+        if content_length > MAX_IMAGE_SIZE:
+            logger.warning(
+                "Skipping oversized image (%d bytes): %s",
+                content_length,
+                url[:100],
+            )
+            return None, None
+
         response = session.get(url)
-    except Exception:
-        return None, None
+        if response.status_code != 200:
+            logger.warning(
+                "Image fetch failed (HTTP %d): %s",
+                response.status_code,
+                url[:100],
+            )
+            return None, None
 
-    if response.status_code != 200:
-        return None, None
+        if len(response.content) > MAX_IMAGE_SIZE:
+            logger.warning(
+                "Skipping oversized image (%d bytes): %s",
+                len(response.content),
+                url[:100],
+            )
+            return None, None
 
-    content_type = response.headers.get("Content-Type", "image/png")
-    data_b64 = base64.b64encode(response.content).decode("ascii")
-    return data_b64, content_type
+        content_type = response.headers.get("Content-Type", "image/png")
+        data_b64 = base64.b64encode(response.content).decode("ascii")
+        return data_b64, content_type
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        logger.warning("Image fetch error: %s - %s", type(exc).__name__, url[:100])
+        return None, None
 
 
 def _find_monospace_font_path() -> str | None:
+    """Return the path to the first available monospace font, or ``None``."""
     candidates = [
+        # macOS
         "/System/Library/Fonts/Menlo.ttc",
         "/System/Library/Fonts/Courier.ttc",
         "/Library/Fonts/Courier New.ttf",
+        # Linux
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        # Windows
+        "C:/Windows/Fonts/consola.ttf",
+        "C:/Windows/Fonts/cour.ttf",
     ]
     for candidate in candidates:
         if os.path.exists(candidate):
@@ -215,6 +272,7 @@ def _render_table_image(rows: list[list[str]]) -> tuple[str, str]:
 
     buffer = BytesIO()
     image.save(buffer, format="PNG")
+    image.close()
     data_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
     return data_b64, "image/png"
 
@@ -358,45 +416,55 @@ def _extract_structural_items(
     return items
 
 
-def get_document_content(doc_id: str) -> str:
-    service = get_docs_service()
-    doc = service.documents().get(documentId=doc_id).execute()
-    content = doc.get("body", {}).get("content", [])
+def get_document(doc_id: str) -> dict[str, Any]:
+    """Fetch a Google Doc once and return items, content, and title.
 
-    text_content: list[str] = []
-    for element in content:
-        text_content.extend(_extract_structural_element_text(element))
-
-    return "\n".join(chunk for chunk in text_content if chunk)
-
-
-def get_document_title(doc_id: str) -> str:
-    service = get_docs_service()
-    doc = service.documents().get(documentId=doc_id).execute()
-    return doc.get("title", "Quiz from Google Doc")
-
-
-def get_document_items(doc_id: str) -> list[dict[str, Any]]:
-    credentials = get_credentials()
+    Returns:
+        A dict with keys ``items``, ``content``, and ``title``.
+    """
+    credentials = _get_cached_credentials()
     service = discovery.build("docs", "v1", credentials=credentials)
     doc = service.documents().get(documentId=doc_id).execute()
-    content = doc.get("body", {}).get("content", [])
+
+    title = doc.get("title", "Quiz from Google Doc")
+    content_elements = doc.get("body", {}).get("content", [])
     inline_objects = doc.get("inlineObjects", {})
     session = AuthorizedSession(credentials)
-    inline_object_cache: dict[str, dict[str, Any]] = {}
 
+    # Extract text content
+    text_chunks: list[str] = []
+    for element in content_elements:
+        text_chunks.extend(_extract_structural_element_text(element))
+    content = "\n".join(chunk for chunk in text_chunks if chunk)
+
+    # Extract structured items
+    inline_object_cache: dict[str, dict[str, Any]] = {}
     items: list[dict[str, Any]] = []
-    for element in content:
+    for element in content_elements:
         items.extend(
             _extract_structural_items(
                 element, inline_objects, inline_object_cache, session
             )
         )
-
     for idx, item in enumerate(items, start=1):
         item["id"] = idx
 
-    return items
+    return {"items": items, "content": content, "title": title}
+
+
+def get_document_content(doc_id: str) -> str:
+    """Return the plain-text content of a Google Doc."""
+    return get_document(doc_id)["content"]
+
+
+def get_document_title(doc_id: str) -> str:
+    """Return the title of a Google Doc."""
+    return get_document(doc_id)["title"]
+
+
+def get_document_items(doc_id: str) -> list[dict[str, Any]]:
+    """Return the structured items extracted from a Google Doc."""
+    return get_document(doc_id)["items"]
 
 
 def create_form(title: str, questions: list[dict[str, Any]]) -> str:

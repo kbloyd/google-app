@@ -4,9 +4,14 @@ import os
 import time
 from typing import Any
 
-from anthropic import Anthropic, RateLimitError
+from anthropic import Anthropic, APIStatusError, RateLimitError
 
 logger = logging.getLogger(__name__)
+
+LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-5-20250929")
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
 
 
 SYSTEM_PROMPT = """You are a helpful assistant that extracts multiple choice quiz questions from text.
@@ -61,12 +66,18 @@ Do not extract answer-key content as questions or context.
 Extract ALL questions from the document. Only output valid JSON, no explanation."""
 
 
+_client: Anthropic | None = None
+
+
 def _get_client() -> Anthropic:
-    """Create an Anthropic client with the API key from environment."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
-    return Anthropic(api_key=api_key)
+    """Return a lazily-cached Anthropic client."""
+    global _client
+    if _client is None:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
+        _client = Anthropic(api_key=api_key)
+    return _client
 
 
 def _parse_json_response(content: str) -> list[dict[str, Any]]:
@@ -96,10 +107,10 @@ def parse_document_with_claude(document_text: str) -> list[dict[str, Any]]:
     client = _get_client()
 
     message = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=4096,
+        model=LLM_MODEL,
+        max_tokens=LLM_MAX_TOKENS,
         system=SYSTEM_PROMPT,
-        temperature=0.3,
+        temperature=LLM_TEMPERATURE,
         messages=[
             {
                 "role": "user",
@@ -140,10 +151,10 @@ def parse_document_items_with_claude(
     slim_items = _slim_items_for_llm(items)
     serialized_items = json.dumps(slim_items, ensure_ascii=True)
     logger.info(
-        "LLM payload: %d items, ~%d chars (original had %d chars)",
+        "LLM payload: %d items, ~%d chars (original ~%d items)",
         len(slim_items),
         len(serialized_items),
-        len(json.dumps(items, ensure_ascii=True)),
+        len(items),
     )
 
     system_instruction = (
@@ -159,10 +170,10 @@ def parse_document_items_with_claude(
     for attempt in range(MAX_RETRIES):
         try:
             message = client.messages.create(
-                model="claude-sonnet-4-5-20250929",
-                max_tokens=4096,
+                model=LLM_MODEL,
+                max_tokens=LLM_MAX_TOKENS,
                 system=system_instruction,
-                temperature=0.3,
+                temperature=LLM_TEMPERATURE,
                 messages=[
                     {
                         "role": "user",
@@ -171,10 +182,13 @@ def parse_document_items_with_claude(
                 ],
             )
             return _parse_json_response(message.content[0].text)
-        except RateLimitError as exc:
-            wait = INITIAL_BACKOFF_S * (2**attempt)
+        except (RateLimitError, APIStatusError) as exc:
+            # Only retry on rate limits and server errors (5xx)
+            if isinstance(exc, APIStatusError) and exc.status_code < 500:
+                raise
             if attempt == MAX_RETRIES - 1:
                 raise
+            wait = min(INITIAL_BACKOFF_S * (2**attempt), 30.0)
             logger.warning(
                 "Rate limited (attempt %d/%d). Retrying in %.0fs…",
                 attempt + 1,
@@ -183,4 +197,5 @@ def parse_document_items_with_claude(
             )
             time.sleep(wait)
 
-    raise RuntimeError("Unreachable")
+    # All retries exhausted — the final attempt re-raises above
+    raise RuntimeError("Retry loop exited without returning or raising")

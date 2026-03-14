@@ -1,24 +1,35 @@
 import logging
 import os
-import re
 from typing import Any
 
 from dotenv import load_dotenv
 from flask import (
     Flask,
+    flash,
+    redirect,
     render_template_string,
     request,
-    redirect,
     url_for,
-    flash,
 )
+from googleapiclient.errors import HttpError
 
-from services import google_service, parser, apps_script_client
+from services import (
+    apps_script_client,
+    answer_key_parser,
+    context_assigner,
+    google_service,
+    parser,
+    question_processor,
+)
+from services.constants import ANSWER_NORMALIZE_PATTERN
 
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
+_secret_key = os.getenv("SECRET_KEY", "")
+if not _secret_key and os.getenv("RENDER", ""):
+    raise RuntimeError("SECRET_KEY must be set in production")
+app.secret_key = _secret_key or "dev-secret-key-change-in-production"
 logging.basicConfig(level=logging.INFO)
 
 
@@ -331,9 +342,90 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# Store questions in memory (in production, use Flask session)
-_current_questions: list[dict[str, Any]] = []
-_current_title: str = "Quiz from Google Doc"
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize whitespace and case-fold text for comparison."""
+    return " ".join(text.split()).casefold()
+
+
+def _is_answer_key_text(text: str) -> bool:
+    """Check if text appears to be an answer key header."""
+    from services.constants import ANSWER_KEY_MARKERS
+
+    normalized = _normalize_text(text)
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in ANSWER_KEY_MARKERS)
+
+
+def _item_text_for_filter(item: dict[str, Any]) -> str:
+    """Extract and normalize all text fields from an item for filtering."""
+    parts = [
+        str(item.get("text") or ""),
+        str(item.get("title") or ""),
+        str(item.get("table_text_preview") or ""),
+    ]
+    return _normalize_text(" ".join(part for part in parts if part))
+
+
+def _normalize_answer(text: str) -> str:
+    """Strip leading option prefixes like 'B)', '2)', '2.', etc."""
+    stripped = ANSWER_NORMALIZE_PATTERN.sub("", text).strip()
+    return " ".join(stripped.split()).casefold()
+
+
+def _find_answer_key_boundary(
+    item_ids_in_order: list[int],
+    item_by_id: dict[int, dict[str, Any]],
+    item_id_to_index: dict[int, int],
+) -> int:
+    """Return the doc index where the answer-key section starts."""
+    for item_id in item_ids_in_order:
+        item = item_by_id[item_id]
+        if item.get("type") not in {"section", "paragraph", "table", "image"}:
+            continue
+        if _is_answer_key_text(_item_text_for_filter(item)):
+            return item_id_to_index[item_id]
+    return len(item_ids_in_order)
+
+
+def _apply_answer_key(
+    questions: list[dict[str, Any]],
+    answer_key: dict[int, dict[str, str]],
+) -> None:
+    """Match answer-key entries to questions and set grading fields."""
+    if not answer_key:
+        return
+    for q_idx, q in enumerate(questions, start=1):
+        ak_entry = answer_key.get(q_idx)
+        if not ak_entry:
+            continue
+        options = q.get("options") or []
+        if not options:
+            continue
+        correct_raw = ak_entry["correct_answer"]
+        correct_norm = _normalize_answer(correct_raw)
+        matched_option = None
+        for opt in options:
+            if _normalize_answer(opt) == correct_norm:
+                matched_option = opt
+                break
+        if matched_option is None:
+            for opt in options:
+                opt_norm = _normalize_answer(opt)
+                if correct_norm in opt_norm or opt_norm in correct_norm:
+                    matched_option = opt
+                    break
+        if matched_option:
+            q["correct_answer"] = matched_option
+            q["points"] = 1
+            if ak_entry.get("explanation"):
+                q["explanation"] = ak_entry["explanation"]
 
 
 @app.route("/")
@@ -345,8 +437,6 @@ def index():
 
 @app.route("/convert", methods=["POST"])
 def convert():
-    global _current_questions, _current_title
-
     doc_url = request.form.get("doc_url", "").strip()
 
     if not doc_url:
@@ -355,15 +445,17 @@ def convert():
 
     if not apps_script_client.is_configured():
         flash(
-            "Apps Script Web App is not configured. Please add APPS_SCRIPT_WEB_APP_URL to your .env file."
+            "Apps Script Web App is not configured. "
+            "Please add APPS_SCRIPT_WEB_APP_URL to your .env file."
         )
         return redirect(url_for("index"))
 
     try:
         doc_id = google_service.extract_doc_id(doc_url)
-        doc_items = google_service.get_document_items(doc_id)
-        doc_content = google_service.get_document_content(doc_id)
-        doc_title = google_service.get_document_title(doc_id)
+        doc_data = google_service.get_document(doc_id)
+        doc_items = doc_data["items"]
+        doc_content = doc_data["content"]
+        doc_title = doc_data["title"]
 
         if not doc_content or len(doc_content.strip()) < 10:
             flash("Document appears to be empty. Make sure the document has content.")
@@ -371,128 +463,29 @@ def convert():
 
         questions = parser.parse_document_items_with_claude(doc_items)
 
-        unique_questions: list[dict[str, Any]] = []
-        seen_questions: set[str] = set()
+        # Build indexes
         item_ids_in_order = [item["id"] for item in doc_items]
         item_by_id = {item["id"]: item for item in doc_items}
         item_id_to_index = {
             item_id: idx for idx, item_id in enumerate(item_ids_in_order)
         }
 
-        answer_key_markers = {
-            "answer key",
-            "correct answer",
-            "correct answers",
-            "explanation",
-            "solutions",
-            "solution key",
-        }
-
-        def normalize_text(text: str) -> str:
-            return " ".join(text.split()).casefold()
-
-        def is_answer_key_text(text: str) -> bool:
-            normalized = normalize_text(text)
-            if not normalized:
-                return False
-            return any(marker in normalized for marker in answer_key_markers)
-
-        def item_text_for_filter(item: dict[str, Any]) -> str:
-            parts = [
-                str(item.get("text") or ""),
-                str(item.get("title") or ""),
-                str(item.get("table_text_preview") or ""),
-            ]
-            return normalize_text(" ".join(part for part in parts if part))
-
-        answer_key_start_index = len(item_ids_in_order)
-        for item_id in item_ids_in_order:
-            item = item_by_id[item_id]
-            if item.get("type") not in {"section", "paragraph", "table", "image"}:
-                continue
-            if is_answer_key_text(item_text_for_filter(item)):
-                answer_key_start_index = item_id_to_index[item_id]
-                break
-
+        # Find answer key boundary
+        answer_key_start_index = _find_answer_key_boundary(
+            item_ids_in_order, item_by_id, item_id_to_index
+        )
         eligible_item_ids = {
-            item_id
-            for item_id in item_ids_in_order
-            if item_id_to_index[item_id] < answer_key_start_index
+            iid
+            for iid in item_ids_in_order
+            if item_id_to_index[iid] < answer_key_start_index
         }
 
-        # --- Parse answer key table for quiz grading ---
-        answer_key: dict[int, dict[str, str]] = {}
-        for item_id in item_ids_in_order:
-            if item_id_to_index[item_id] < answer_key_start_index:
-                continue
-            item = item_by_id[item_id]
-            rows = item.get("table_rows")
-            if not rows or len(rows) < 2:
-                continue
-            header = [cell.strip().casefold() for cell in rows[0]]
-            q_col = ans_col = exp_col = None
-            for ci, h in enumerate(header):
-                if "question" in h:
-                    q_col = ci
-                elif "correct" in h or "answer" in h:
-                    if ans_col is None:
-                        ans_col = ci
-                elif "explanation" in h or "feedback" in h:
-                    exp_col = ci
-            if q_col is None:
-                q_col = 0
-            if ans_col is None:
-                ans_col = 1 if len(header) > 1 else 0
-            if exp_col is None and len(header) > 2:
-                exp_col = 2
-            for data_row in rows[1:]:
-                if len(data_row) <= max(q_col, ans_col):
-                    continue
-                raw_q = data_row[q_col].strip()
-                q_num_match = re.match(r"(\d+)", raw_q)
-                if not q_num_match:
-                    continue
-                q_num = int(q_num_match.group(1))
-                correct_ans = data_row[ans_col].strip() if ans_col < len(data_row) else ""
-                explanation = ""
-                if exp_col is not None and exp_col < len(data_row):
-                    explanation = data_row[exp_col].strip()
-                if correct_ans:
-                    answer_key[q_num] = {
-                        "correct_answer": correct_ans,
-                        "explanation": explanation,
-                    }
+        # Parse answer key
+        answer_key = answer_key_parser.parse_answer_key(
+            item_ids_in_order, item_by_id, item_id_to_index, answer_key_start_index
+        )
 
-        # --- Parse paragraph-based answer keys (e.g., "1. B) 1985  2. C) Topps ...") ---
-        if not answer_key:
-            ak_paragraph_pattern = re.compile(
-                r"(\d+)\.\s*([A-Da-d])\)\s*(.+?)(?=\s*\d+\.\s*[A-Da-d]\)|$)",
-                re.DOTALL,
-            )
-            ak_text_parts: list[str] = []
-            for item_id in item_ids_in_order:
-                if item_id_to_index[item_id] < answer_key_start_index:
-                    continue
-                item = item_by_id[item_id]
-                raw = str(item.get("text") or item.get("title") or "").strip()
-                if raw:
-                    ak_text_parts.append(raw)
-            ak_full_text = " ".join(ak_text_parts)
-            for m in ak_paragraph_pattern.finditer(ak_full_text):
-                q_num = int(m.group(1))
-                letter = m.group(2).upper()
-                ans_text = m.group(3).strip()
-                # Extract explanation from parenthetical if present
-                explanation = ""
-                paren_match = re.search(r"\((.+?)\)\s*$", ans_text)
-                if paren_match:
-                    explanation = paren_match.group(1).strip()
-                    ans_text = ans_text[: paren_match.start()].strip()
-                answer_key[q_num] = {
-                    "correct_answer": f"{letter}) {ans_text}" if ans_text else letter,
-                    "explanation": explanation,
-                }
-
+        # Build paragraph items for anchoring
         paragraph_items: list[tuple[int, str]] = []
         for item_id in item_ids_in_order:
             if item_id not in eligible_item_ids:
@@ -500,399 +493,50 @@ def convert():
             item = item_by_id[item_id]
             if item.get("type") in {"paragraph", "section"}:
                 text_value = item.get("text") or item.get("title") or ""
-                normalized = normalize_text(str(text_value))
+                normalized = _normalize_text(str(text_value))
                 if normalized:
                     paragraph_items.append((item_id_to_index[item_id], normalized))
-        for q in questions:
-            question_text = str(q.get("question", "")).strip()
-            if not question_text:
-                continue
 
-            options = q.get("options") or []
-            if not isinstance(options, list):
-                options = []
-            options = [str(opt).strip() for opt in options if str(opt).strip()]
-
-            q_type = str(q.get("type", "multiple_choice")).strip().lower()
-            allowed_types = {
-                "multiple_choice",
-                "checkbox",
-                "short_answer",
-                "paragraph",
-            }
-            if q_type not in allowed_types:
-                q_type = "multiple_choice" if options else "short_answer"
-            if q_type in {"multiple_choice", "checkbox"} and not options:
-                q_type = "short_answer"
-
-            q["type"] = q_type
-            q["options"] = options
-
-            normalized = " ".join(question_text.split()).casefold()
-            if normalized in seen_questions:
-                continue
-            seen_questions.add(normalized)
-
-            question_index = None
-            for idx, item_text in paragraph_items:
-                if normalized and normalized in item_text:
-                    question_index = idx
-                    break
-                if item_text and item_text in normalized:
-                    question_index = idx
-                    break
-
-            if question_index is None:
-                question_index = 0
-
-            q["_question_index"] = question_index
-
-            unique_questions.append(q)
-        questions = unique_questions
-
-        questions.sort(key=lambda item: item.get("_question_index", 0))
-
-        # Merge consecutive questions that share identical option sets.
-        # This handles LLM splitting a preamble + actual question into two entries.
-        merged_questions: list[dict[str, Any]] = []
-        skip_next = False
-        for idx in range(len(questions)):
-            if skip_next:
-                skip_next = False
-                continue
-            q = questions[idx]
-            if idx + 1 < len(questions):
-                next_q = questions[idx + 1]
-                q_opts = [
-                    normalize_text(str(o))
-                    for o in q.get("options", [])
-                    if str(o).strip()
-                ]
-                next_opts = [
-                    normalize_text(str(o))
-                    for o in next_q.get("options", [])
-                    if str(o).strip()
-                ]
-                if q_opts and q_opts == next_opts:
-                    q_text = str(q.get("question", ""))
-                    next_text = str(next_q.get("question", ""))
-                    # Keep the question that contains '?'; default to later one
-                    if "?" in next_text:
-                        keep, drop = next_q, q
-                    elif "?" in q_text:
-                        keep, drop = q, next_q
-                    else:
-                        keep, drop = next_q, q
-                    # Adopt earlier anchor so context before the preamble attaches
-                    keep["_question_index"] = min(
-                        int(q.get("_question_index", 0)),
-                        int(next_q.get("_question_index", 0)),
-                    )
-                    # Remember dropped text so it gets filtered as duplicate content
-                    keep["_dropped_preamble"] = str(drop.get("question", ""))
-                    merged_questions.append(keep)
-                    skip_next = True
-                    continue
-            merged_questions.append(q)
-        questions = merged_questions
-
-        # Build a set of normalized question texts and option texts
-        # so we can filter out context paragraphs that duplicate question/option content
-        question_texts_set: set[str] = set()
-        option_texts_set: set[str] = set()
-        for q in questions:
-            q_text = normalize_text(str(q.get("question", "")))
-            if q_text:
-                question_texts_set.add(q_text)
-            # Include dropped preamble text so it gets filtered as duplicate
-            preamble = normalize_text(str(q.pop("_dropped_preamble", "") or ""))
-            if preamble:
-                question_texts_set.add(preamble)
-            for opt in q.get("options", []):
-                opt_text = normalize_text(str(opt))
-                if opt_text:
-                    option_texts_set.add(opt_text)
-
-        answer_label_pattern = re.compile(r"^[a-d]\)\s+", re.IGNORECASE)
-        # Patterns for bullet/checkbox-style option lines: "● [ ] Option", "[ ] Option"
-        bullet_checkbox_pattern = re.compile(
-            r"^[●•\-\*\d.)\s]*\[[\sx]?\]\s*", re.IGNORECASE
-        )
-        # Pattern for numbered option prefixes: "1. Option", "2) Option"
-        numbered_option_pattern = re.compile(r"^\d+[.)]\s+")
-        # Doc-authoring tip pattern
-        doc_tip_pattern = re.compile(
-            r"^tip\s*:", re.IGNORECASE
+        # Process questions (dedup, validate, sort, merge)
+        seen_questions: set[str] = set()
+        questions = question_processor.process_questions(
+            questions, paragraph_items, seen_questions
         )
 
-        def _strip_option_prefix(text: str) -> str:
-            """Remove bullet, checkbox, number, and letter prefixes from text."""
-            stripped = re.sub(r"^[●•\-\*]\s*", "", text)
-            stripped = re.sub(r"^\[[\sx]?\]\s*", "", stripped)
-            stripped = re.sub(r"^\d+[.)]\s+", "", stripped)
-            stripped = re.sub(r"^[a-d]\)\s+", "", stripped, flags=re.IGNORECASE)
-            return stripped.strip()
+        # Build dedup sets for context filtering
+        question_texts_set, option_texts_set = (
+            question_processor.build_dedup_sets(questions)
+        )
 
-        # Pattern for leading question numbers: "6. ", "10. ", "4) "
-        leading_number_pattern = re.compile(r"^\d+[.)]\s*")
-        # Pattern for underscore-only filler lines (essay answer blanks)
-        underscore_filler_pattern = re.compile(r"^[_\s]+$")
-
-        def is_duplicate_content(item: dict[str, Any]) -> bool:
-            """Check if a paragraph/section item duplicates question or option text."""
-            if item["type"] not in {"paragraph", "section", "table", "image"}:
-                return False
-            text = item_text_for_filter(item)
-            if not text:
-                return False
-            if is_answer_key_text(text):
-                return True
-            # Filter underscore-only filler lines (essay answer blanks)
-            if underscore_filler_pattern.match(text):
-                return True
-            # Allow table-sourced images when they are before the answer-key
-            # cutoff; only block tables whose preview contains answer-key markers.
-            if item.get("type") == "image" and item.get("source_kind") == "table":
-                preview = normalize_text(str(item.get("table_text_preview") or ""))
-                if is_answer_key_text(preview):
-                    return True
-                return False
-            # Also compare with leading number prefix stripped
-            text_no_num = leading_number_pattern.sub("", text).strip()
-            texts_to_check = {text}
-            if text_no_num and text_no_num != text:
-                texts_to_check.add(text_no_num)
-            for t in texts_to_check:
-                if t in question_texts_set:
-                    return True
-                for q_text in question_texts_set:
-                    if q_text and q_text in t:
-                        return True
-                    if t in q_text:
-                        return True
-            if answer_label_pattern.match(text):
-                return True
-            for t in texts_to_check:
-                if t in option_texts_set:
-                    return True
-            # Strip bullet/checkbox/number prefixes and re-check against options
-            stripped = _strip_option_prefix(text)
-            if stripped and stripped in option_texts_set:
-                return True
-            # Skip doc-authoring tips referencing Google Docs features
-            if doc_tip_pattern.match(text) and (
-                "google docs" in text or "google doc" in text
-            ):
-                return True
-            if text in {
-                "mark only one oval",
-                "mark only one oval.",
-                "check all that apply",
-                "check all that apply.",
-            }:
-                return True
-            return False
-
-        # --- Phase 1 + 4: Anchor-based, forward-correct context assignment ---
-        # Build section boundaries for scoring
-        section_starts: list[int] = [0]
-        for item_id in item_ids_in_order:
-            item = item_by_id[item_id]
-            if item.get("type") == "section":
-                section_starts.append(item_id_to_index[item_id])
-
-        def _section_of(doc_index: int) -> int:
-            """Return the section number an index belongs to."""
-            sec = 0
-            for s_idx, start in enumerate(section_starts):
-                if doc_index >= start:
-                    sec = s_idx
-            return sec
-
-        # Collect all eligible context items (not questions, not answer-key)
-        context_item_ids = [
-            item_id
-            for item_id in item_ids_in_order
-            if item_id in eligible_item_ids
-            and item_by_id[item_id]["type"]
-            in {"section", "paragraph", "image", "table"}
-            and not is_duplicate_content(item_by_id[item_id])
-        ]
-
-        # Score each (context_item, question) pair; higher is better
-        def _score_candidate(
-            ctx_index: int, q_index: int, q_section: int
-        ) -> tuple[int, int, int]:
-            """Return (section_match, -distance, type_priority)."""
-            ctx_section = _section_of(ctx_index)
-            section_match = 1 if ctx_section == q_section else 0
-            distance = abs(q_index - ctx_index)
-            item = item_by_id[item_ids_in_order[ctx_index]]
-            type_priority = (
-                3
-                if item["type"] == "image"
-                else 2
-                if item["type"] == "table"
-                else 1
-                if item["type"] == "section"
-                else 0
-            )
-            return (section_match, -distance, type_priority)
-
-        # Build question anchors
-        q_anchors = [
-            (idx, int(q.get("_question_index", 0))) for idx, q in enumerate(questions)
-        ]
-
-        # For each context item, find the best owning question:
-        # - item must appear BEFORE the question anchor (forward-correct)
-        # - prefer same section, closest distance, then type priority
-        claim_map: dict[int, int] = {}  # context_item_id -> question_list_index
-        for ctx_id in context_item_ids:
-            ctx_index = item_id_to_index[ctx_id]
-            best_q_idx: int | None = None
-            best_score: tuple[int, int, int] | None = None
-            for q_idx, q_anchor in q_anchors:
-                if ctx_index >= q_anchor:
-                    continue  # context must be before its question
-                score = _score_candidate(
-                    ctx_index, q_anchor, _section_of(q_anchor)
-                )
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_q_idx = q_idx
-            # Fallback: if no question comes after, attach to nearest prior question
-            if best_q_idx is None:
-                for q_idx, q_anchor in reversed(q_anchors):
-                    if q_anchor <= ctx_index:
-                        best_q_idx = q_idx
-                        break
-            if best_q_idx is not None:
-                claim_map[ctx_id] = best_q_idx
-
-        # Assign context_ids per question in document order
-        for idx, q in enumerate(questions):
-            assigned = sorted(
-                [
-                    ctx_id
-                    for ctx_id, owner_idx in claim_map.items()
-                    if owner_idx == idx
-                ],
-                key=lambda cid: item_id_to_index[cid],
-            )
-            q["context_ids"] = assigned
-
-        # --- Consolidate consecutive paragraph context items ---
-        # Merge runs of adjacent paragraphs into a single item so they
-        # appear as one block in the form instead of separate section headers.
-        next_synthetic_id = max(item_ids_in_order) + 1
-        for q in questions:
-            ctx_ids = q.get("context_ids", [])
-            if len(ctx_ids) <= 1:
-                continue
-            new_ctx_ids: list[int] = []
-            paragraph_run: list[int] = []
-
-            def _flush_paragraph_run() -> None:
-                nonlocal next_synthetic_id
-                if len(paragraph_run) <= 1:
-                    new_ctx_ids.extend(paragraph_run)
-                    return
-                merged_text = "\n".join(
-                    str(item_by_id[pid].get("text") or "")
-                    for pid in paragraph_run
-                )
-                merged_item: dict[str, Any] = {
-                    "id": next_synthetic_id,
-                    "type": "paragraph",
-                    "text": merged_text,
-                }
-                doc_items.append(merged_item)
-                item_by_id[next_synthetic_id] = merged_item
-                new_ctx_ids.append(next_synthetic_id)
-                next_synthetic_id += 1
-
-            for cid in ctx_ids:
-                item = item_by_id[cid]
-                if item["type"] == "paragraph":
-                    paragraph_run.append(cid)
-                else:
-                    _flush_paragraph_run()
-                    paragraph_run = []
-                    new_ctx_ids.append(cid)
-            _flush_paragraph_run()
-            q["context_ids"] = new_ctx_ids
-
-        # --- Phase 5: Debug trace (gated by DEBUG_CONTEXT env var) ---
-        if os.getenv("DEBUG_CONTEXT"):
-            for idx, q in enumerate(questions):
-                q_text = str(q.get("question", ""))[:60]
-                ctx_ids = q.get("context_ids", [])
-                ctx_details = []
-                for cid in ctx_ids:
-                    ci = item_by_id.get(cid, {})
-                    ctx_details.append(
-                        f"  id={cid} type={ci.get('type')} "
-                        f"source_kind={ci.get('source_kind', '-')} "
-                        f"title={str(ci.get('title') or ci.get('text') or '')[:40]}"
-                    )
-                logging.info(
-                    "Q%d [anchor=%s]: %s\n  context_ids=%s\n%s",
-                    idx,
-                    q.get("_question_index", "?"),
-                    q_text,
-                    ctx_ids,
-                    "\n".join(ctx_details) if ctx_details else "  (none)",
-                )
+        # Assign context items to questions
+        context_assigner.assign_context(
+            questions,
+            doc_items,
+            eligible_item_ids,
+            item_by_id,
+            item_id_to_index,
+            item_ids_in_order,
+            question_texts_set,
+            option_texts_set,
+        )
 
         for q in questions:
             q.pop("_question_index", None)
 
-        # --- Apply answer key to questions for quiz grading ---
-        if answer_key:
-            def _normalize_answer(text: str) -> str:
-                """Strip leading option prefixes like 'B)', '2)', '2.', etc."""
-                stripped = re.sub(r"^[A-Da-d0-9]+[.)]\s*", "", text).strip()
-                return " ".join(stripped.split()).casefold()
-
-            for q_idx, q in enumerate(questions, start=1):
-                ak_entry = answer_key.get(q_idx)
-                if not ak_entry:
-                    continue
-                options = q.get("options") or []
-                if not options:
-                    continue
-                correct_raw = ak_entry["correct_answer"]
-                correct_norm = _normalize_answer(correct_raw)
-                matched_option = None
-                for opt in options:
-                    if _normalize_answer(opt) == correct_norm:
-                        matched_option = opt
-                        break
-                if matched_option is None:
-                    for opt in options:
-                        if correct_norm in _normalize_answer(opt) or _normalize_answer(opt) in correct_norm:
-                            matched_option = opt
-                            break
-                if matched_option:
-                    q["correct_answer"] = matched_option
-                    q["points"] = 1
-                    if ak_entry.get("explanation"):
-                        q["explanation"] = ak_entry["explanation"]
+        # Apply answer key for quiz grading
+        _apply_answer_key(questions, answer_key)
 
         if not questions:
             flash(
-                "No questions found in the document. Make sure your document contains multiple choice questions."
+                "No questions found in the document. "
+                "Make sure your document contains multiple choice questions."
             )
             return redirect(url_for("index"))
 
-        # Store questions
-        _current_questions = questions
-        _current_title = doc_title or "Quiz from Google Doc"
-
         # Create form via Apps Script
+        form_title = doc_title or "Quiz from Google Doc"
         result = apps_script_client.create_form_with_items_via_apps_script(
-            _current_title, doc_items, questions
+            form_title, doc_items, questions
         )
 
         if result.get("success"):
@@ -911,6 +555,18 @@ def convert():
 
     except ValueError as e:
         flash(str(e))
+        return redirect(url_for("index"))
+    except HttpError as e:
+        logging.exception("Google API error")
+        if e.resp.status == 404:
+            flash("Document not found. Check the URL and sharing permissions.")
+        elif e.resp.status == 403:
+            flash(
+                "Access denied. Make sure the document is shared "
+                "with the service account."
+            )
+        else:
+            flash(f"Google API error: {e.resp.status}")
         return redirect(url_for("index"))
     except Exception as e:
         logging.exception("Conversion failed")

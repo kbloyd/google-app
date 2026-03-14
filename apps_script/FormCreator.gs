@@ -14,12 +14,48 @@
  * 8. Click Deploy
  * 9. Copy the Web App URL
  * 10. Add it to your .env as APPS_SCRIPT_WEB_APP_URL
+ *
+ * Optional: Set APPS_SCRIPT_SECRET in Script Properties for shared-secret auth.
  */
+
+/**
+ * Set choices with correct-answer feedback on a quiz item.
+ *
+ * Works with both CheckboxItem and MultipleChoiceItem since they share
+ * the same createChoice / setPoints / setFeedback* API surface.
+ */
+function _setChoicesWithFeedback(item, options, correctAnswer, points, explanation) {
+  item.setChoices(options.map(function(opt) {
+    return item.createChoice(opt, opt === correctAnswer);
+  }));
+  item.setPoints(points);
+  if (explanation) {
+    item.setFeedbackForCorrect(
+      FormApp.createFeedback().setText(explanation).build()
+    );
+    item.setFeedbackForIncorrect(
+      FormApp.createFeedback().setText(explanation).build()
+    );
+  }
+}
 
 function doPost(e) {
   try {
     // Parse the request
     var data = JSON.parse(e.postData.contents);
+
+    // Validate shared secret if configured
+    var expectedSecret = PropertiesService.getScriptProperties().getProperty('APPS_SCRIPT_SECRET');
+    if (expectedSecret && expectedSecret !== data.secret) {
+      return ContentService
+        .createTextOutput(JSON.stringify({
+          success: false,
+          error: 'Unauthorized: invalid secret',
+          message: 'Authentication failed'
+        }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
     var title = data.title || 'Untitled Form';
     var questions = data.questions || [];
     var items = data.items || [];
@@ -54,14 +90,19 @@ function doPost(e) {
           imageItem.setTitle(item.title);
         }
         if (item.image_data && item.image_mime_type) {
-          var data = Utilities.base64Decode(item.image_data);
-          var blob = Utilities.newBlob(data, item.image_mime_type, 'doc-image');
+          var imgData = Utilities.base64Decode(item.image_data);
+          var blob = Utilities.newBlob(imgData, item.image_mime_type, 'doc-image');
           imageItem.setImage(blob);
         } else {
           var imageUrl = item.source_url || item.sourceUrl;
           if (imageUrl) {
-            var image = UrlFetchApp.fetch(imageUrl).getBlob();
-            imageItem.setImage(image);
+            try {
+              var image = UrlFetchApp.fetch(imageUrl).getBlob();
+              imageItem.setImage(image);
+            } catch (imgError) {
+              Logger.log('Failed to fetch image: ' + imageUrl + ' - ' + imgError.toString());
+              // Skip this image gracefully
+            }
           }
         }
       }
@@ -81,18 +122,7 @@ function doPost(e) {
         checkbox.setTitle(questionText);
         if (options.length) {
           if (correctAnswer) {
-            checkbox.setChoices(options.map(function(opt) {
-              return checkbox.createChoice(opt, opt === correctAnswer);
-            }));
-            checkbox.setPoints(points);
-            if (explanation) {
-              checkbox.setFeedbackForCorrect(
-                FormApp.createFeedback().setText(explanation).build()
-              );
-              checkbox.setFeedbackForIncorrect(
-                FormApp.createFeedback().setText(explanation).build()
-              );
-            }
+            _setChoicesWithFeedback(checkbox, options, correctAnswer, points, explanation);
           } else {
             checkbox.setChoiceValues(options);
           }
@@ -111,18 +141,7 @@ function doPost(e) {
         mc.setTitle(questionText);
         if (options.length) {
           if (correctAnswer) {
-            mc.setChoices(options.map(function(opt) {
-              return mc.createChoice(opt, opt === correctAnswer);
-            }));
-            mc.setPoints(points);
-            if (explanation) {
-              mc.setFeedbackForCorrect(
-                FormApp.createFeedback().setText(explanation).build()
-              );
-              mc.setFeedbackForIncorrect(
-                FormApp.createFeedback().setText(explanation).build()
-              );
-            }
+            _setChoicesWithFeedback(mc, options, correctAnswer, points, explanation);
           } else {
             mc.setChoiceValues(options);
           }
@@ -205,8 +224,8 @@ function doGet(e) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-// Test function
-function testCreateForm() {
+// Development-only test function (not invoked by the web app)
+function _testCreateForm() {
   var testData = {
     title: "Test Quiz from Apps Script",
     questions: [
