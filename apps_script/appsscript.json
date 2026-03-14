@@ -1,0 +1,8 @@
+{
+  "timeZone": "America/Chicago",
+  "exceptionLogging": "STACKDRIVER",
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/forms",
+    "https://www.googleapis.com/auth/script.external_request"
+  ]
+}

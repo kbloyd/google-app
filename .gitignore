@@ -11,3 +11,6 @@ wheels/
 
 # keys
 doc-to-form-converter-32784greyq6t74q.json
+
+# env vars
+.env

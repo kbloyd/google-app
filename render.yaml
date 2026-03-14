@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: google-app
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: APPS_SCRIPT_WEB_APP_URL
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_TYPE
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_PROJECT_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_CLIENT_EMAIL
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_CLIENT_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_AUTH_URI
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_TOKEN_URI
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_AUTH_PROVIDER_X509_CERT_URL
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_CLIENT_X509_CERT_URL
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_UNIVERSE_DOMAIN
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12.3"
