@@ -9,7 +9,7 @@ from anthropic import Anthropic, APIStatusError, RateLimitError
 logger = logging.getLogger(__name__)
 
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-5-20250929")
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16384"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
 
@@ -93,7 +93,11 @@ def _get_client() -> Anthropic:
 
 
 def _parse_json_response(content: str) -> list[dict[str, Any]]:
-    """Strip markdown fences and parse JSON from LLM response."""
+    """Strip markdown fences and parse JSON from LLM response.
+
+    If the response is truncated (common when max_tokens is reached),
+    attempt to repair the JSON by closing open structures.
+    """
     content = content.strip()
     if content.startswith("```json"):
         content = content[7:]
@@ -105,13 +109,48 @@ def _parse_json_response(content: str) -> list[dict[str, Any]]:
 
     try:
         questions = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise Exception(f"Failed to parse AI response as JSON: {content}") from e
+    except json.JSONDecodeError:
+        # Attempt to repair truncated JSON array
+        repaired = _repair_truncated_json(content)
+        if repaired is not None:
+            logger.warning(
+                "LLM response was truncated; recovered %d questions from partial JSON",
+                len(repaired),
+            )
+            return repaired
+        raise Exception(f"Failed to parse AI response as JSON: {content[:200]}...")
 
     if not isinstance(questions, list):
         raise Exception(f"Expected JSON array, got: {type(questions)}")
 
     return questions
+
+
+def _repair_truncated_json(content: str) -> list[dict[str, Any]] | None:
+    """Try to recover a truncated JSON array by closing open structures.
+
+    Returns the parsed list on success, or None if repair fails.
+    """
+    if not content.lstrip().startswith("["):
+        return None
+
+    # Find the last complete object by looking for the last "},"  or "}"
+    # then close the array
+    for end_marker in ["},", "}"]:
+        last_pos = content.rfind(end_marker)
+        if last_pos == -1:
+            continue
+        candidate = content[: last_pos + len(end_marker)]
+        # Remove trailing comma if present and close the array
+        candidate = candidate.rstrip().rstrip(",") + "]"
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, list) and len(result) > 0:
+                return result
+        except json.JSONDecodeError:
+            continue
+
+    return None
 
 
 def parse_document_with_claude(document_text: str) -> list[dict[str, Any]]:
