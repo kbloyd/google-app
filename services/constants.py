@@ -3,7 +3,7 @@
 import re
 
 # --- Compiled regex patterns ---
-ANSWER_LABEL_PATTERN = re.compile(r"^[a-d]\)\s+", re.IGNORECASE)
+ANSWER_LABEL_PATTERN = re.compile(r"^[a-d][.)]\s+", re.IGNORECASE)
 BULLET_CHECKBOX_PATTERN = re.compile(
     r"^[●•\-\*\d.)\s]*\[[\sx]?\]\s*", re.IGNORECASE
 )
@@ -19,7 +19,7 @@ ANSWER_NORMALIZE_PATTERN = re.compile(r"^[A-Da-d0-9]+[.)]\s*")
 OPTION_BULLET_PATTERN = re.compile(r"^[●•\-\*]\s*")
 OPTION_CHECKBOX_PATTERN = re.compile(r"^\[[\sx]?\]\s*")
 OPTION_NUMBER_PATTERN = re.compile(r"^\d+[.)]\s+")
-OPTION_LETTER_PATTERN = re.compile(r"^[a-d]\)\s+", re.IGNORECASE)
+OPTION_LETTER_PATTERN = re.compile(r"^[a-d][.)]\s+", re.IGNORECASE)
 STANDARD_ANNOTATION_PATTERN = re.compile(r"^\([A-Z]+[\.\d\-]+\)\s*")
 QUESTION_TYPE_LABEL_PATTERN = re.compile(
     r"^(?:Multiple Choice|Short Response|Extended Response|Fill in the Blank|Works Cited Construction)"

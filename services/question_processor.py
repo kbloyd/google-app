@@ -95,6 +95,27 @@ def _is_duplicate_content(
     stripped = _strip_option_prefix(text)
     if stripped and stripped in option_texts_set:
         return True
+    # Detect combined-options paragraphs (e.g. "A. opt1 B. opt2 C. opt3 D. opt4").
+    # If the text contains 2+ individual options it is a duplicate options list.
+    if option_texts_set:
+        contained_count = sum(
+            1
+            for opt in option_texts_set
+            if opt and len(opt) > 3 and opt in text
+        )
+        if contained_count >= 2:
+            return True
+    # Filter question-type section labels even when prefixed by annotation markers
+    # such as "(RL.9-10.4) Multiple Choice" or "(W.9-10.9) Short Response".
+    raw_text = " ".join(
+        filter(
+            None,
+            [str(item.get("text") or ""), str(item.get("title") or "")],
+        )
+    ).strip()
+    raw_no_annotation = STANDARD_ANNOTATION_PATTERN.sub("", raw_text).strip()
+    if raw_no_annotation and QUESTION_TYPE_LABEL_PATTERN.match(raw_no_annotation):
+        return True
     if DOC_TIP_PATTERN.match(text) and (
         "google docs" in text or "google doc" in text
     ):
