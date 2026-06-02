@@ -8,7 +8,7 @@ from anthropic import Anthropic, APIStatusError, RateLimitError
 
 logger = logging.getLogger(__name__)
 
-LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-5-20250929")
+LLM_MODEL = os.getenv("LLM_MODEL", "claude-opus-4-5-20250929")
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16384"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
