@@ -161,7 +161,6 @@ def parse_document_with_claude(document_text: str) -> list[dict[str, Any]]:
         model=LLM_MODEL,
         max_tokens=LLM_MAX_TOKENS,
         system=SYSTEM_PROMPT,
-        temperature=LLM_TEMPERATURE,
         messages=[
             {
                 "role": "user",
@@ -224,7 +223,6 @@ def parse_document_items_with_claude(
                 model=LLM_MODEL,
                 max_tokens=LLM_MAX_TOKENS,
                 system=system_instruction,
-                temperature=LLM_TEMPERATURE,
                 messages=[
                     {
                         "role": "user",
